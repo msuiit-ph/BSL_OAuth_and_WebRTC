@@ -1,0 +1,210 @@
+include("lib/http.bzg");
+include("config.bzg");
+
+var server = http(443, 16, 8, 0, 16);
+var maxParticipants = 8;
+var participantSessions = [null, null, null, null, null, null, null, null];
+var participantInfo = [null, null, null, null, null, null, null, null];
+
+function isSuccess(response) {
+    if (response == null) {
+        return false;
+    }
+    return substr(response, 0, 5) == "HTTP/" && substr(response, 9, 3) == "200";
+}
+
+function finishLogin(tokenUrl, clientId, clientSecret, redirectUri, profileUrl) {
+    if (server.oauthValidateState() != 1) {
+        server.sendResponse("Invalid or expired OAuth state.", "text/plain", 400);
+        return;
+    }
+    var code = server.getQuery("code");
+    if (code == null) {
+        server.sendResponse("Authorization was denied or no code was returned.", "text/plain", 400);
+        return;
+    }
+    var response = server.oauthExchangeCode(tokenUrl, clientId, clientSecret, redirectUri, code);
+    if (!isSuccess(response)) {
+        server.sendResponse("Could not exchange the authorization code.", "text/plain", 502);
+        return;
+    }
+    var token = server.oauthGetAccessToken(server.getResponseBody(response));
+    if (token == null) {
+        server.sendResponse("The provider did not return an access token.", "text/plain", 502);
+        return;
+    }
+    var headers = "Authorization: Bearer " + token + "\r\nAccept: application/json\r\n";
+    var profileResponse = server.requestGET(profileUrl, headers);
+    if (!isSuccess(profileResponse)) {
+        server.sendResponse("Could not retrieve the provider profile.", "text/plain", 502);
+        return;
+    }
+    var sessionId = server.oauthSessionCreate(server.getResponseBody(profileResponse));
+    if (sessionId == null) {
+        server.sendResponse("The profile was invalid or the session store is full.", "text/plain", 503);
+        return;
+    }
+    server.oauthSessionClear();
+    server.addHeader("Set-Cookie: bsl_session=" + sessionId +
+        "; Path=/; Max-Age=3600; HttpOnly; Secure; SameSite=Lax");
+    server.redirect("/");
+}
+
+function removePeer(clientId) {
+    if (participantSessions[clientId] != null) {
+        participantSessions[clientId] = null;
+        participantInfo[clientId] = null;
+        var departure = stringifyJSON({kind: "left", id: clientId});
+        for (var i = 0; i < maxParticipants; i = i + 1) {
+            if (participantSessions[i] != null) {
+                server.send(i, departure);
+            }
+        }
+    }
+}
+
+function profileField(profile, key) {
+    // Missing object properties raise runtime errors in BSL.
+    if (regex("\"" + key + "\":", stringifyJSON(profile)) == "") {
+        return null;
+    }
+    try {
+        return profile[key];
+    } catch (error) {
+        return null;
+    }
+}
+
+server.get = function (path, request) {
+    server.addHeader("Cache-Control: no-store");
+    if (path == "/") {
+        server.sendFile("videocall.html");
+    } else if (path == "/login/google") {
+        if (server.oauthStart("https://accounts.google.com/o/oauth2/v2/auth",
+            googleClientId, googleRedirectUri, "openid email profile") != 1) {
+            server.sendResponse("Could not start Google login.", "text/plain", 500);
+        }
+    } else if (path == "/login/github") {
+        if (server.oauthStart("https://github.com/login/oauth/authorize",
+            githubClientId, githubRedirectUri, "read:user") != 1) {
+            server.sendResponse("Could not start GitHub login.", "text/plain", 500);
+        }
+    } else if (path == "/google-callback") {
+        finishLogin("https://oauth2.googleapis.com/token", googleClientId,
+            googleClientSecret, googleRedirectUri, "https://openidconnect.googleapis.com/v1/userinfo");
+    } else if (path == "/github-callback") {
+        finishLogin("https://github.com/login/oauth/access_token", githubClientId,
+            githubClientSecret, githubRedirectUri, "https://api.github.com/user");
+    } else if (path == "/api/me") {
+        var profile = server.oauthSessionGet();
+        if (profile == null) {
+            server.sendResponse("Sign in required.", "text/plain", 401);
+        } else {
+            server.sendResponse(profile, "application/json", 200);
+        }
+    } else {
+        server.sendResponse("Not found.", "text/plain", 404);
+    }
+     gc();
+};
+
+server.post = function (path, request) {
+    server.addHeader("Cache-Control: no-store");
+    if (path == "/logout") {
+        if (server.getHeader("Origin") != baseUrl) {
+            server.sendResponse("Invalid request origin.", "text/plain", 403);
+        } else {
+            var sessionId = server.getCookie("bsl_session");
+            if (sessionId != null) {
+                for (var i = 0; i < maxParticipants; i = i + 1) {
+                    if (participantSessions[i] == sessionId) {
+                        removePeer(i);
+                        server.close(i);
+                    }
+                }
+            }
+            server.oauthSessionClear();
+            server.addHeader("Set-Cookie: bsl_session=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax");
+            server.sendResponse("Signed out.", "text/plain", 200);
+        }
+    } else {
+        server.sendResponse("Not found.", "text/plain", 404);
+    }
+
+     gc();
+};
+
+server.onConnect = function (clientId, path) {
+    var profileJson = server.oauthSessionGet();
+    if (path != "/signal" || server.getHeader("Origin") != baseUrl || profileJson == null) {
+        server.close(clientId);
+    } else {
+        var profile = parseJSON(profileJson);
+        var name = profileField(profile, "name");
+        if (name.type != "string" || name == "") {
+            name = profileField(profile, "login");
+        }
+        if (name.type != "string" || name == "") {
+            name = "Participant";
+        }
+        var picture = profileField(profile, "picture");
+        if (picture.type != "string") {
+            picture = profileField(profile, "avatar_url");
+        }
+        if (picture.type != "string") {
+            picture = "";
+        }
+        participantSessions[clientId] = server.getCookie("bsl_session");
+        participantInfo[clientId] = {name: name, picture: picture};
+        server.send(clientId, stringifyJSON({kind: "self", id: clientId, user: participantInfo[clientId]}));
+        for (var i = 0; i < maxParticipants; i = i + 1) {
+            if (i != clientId && participantSessions[i] != null) {
+                server.send(clientId, stringifyJSON({kind: "existing", id: i, user: participantInfo[i]}));
+                server.send(i, stringifyJSON({kind: "joined", id: clientId, user: participantInfo[clientId]}));
+            }
+        }
+    }
+     gc();
+};
+
+server.onData = function (message, clientId) {
+    if (participantSessions[clientId] != null) {
+        var incoming = parseJSON(message);
+        if (incoming.type != "object") {
+            return;
+        }
+        var kind = profileField(incoming, "kind");
+        if (kind == "signal") {
+            var target = profileField(incoming, "target");
+            var data = profileField(incoming, "data");
+            if (target.type == "number" && target >= 0 && target < maxParticipants &&
+                int(target) == target && target != clientId && participantSessions[target] != null &&
+                data.type == "object") {
+                server.send(target, stringifyJSON({kind: "signal", from: clientId, data: data}));
+            }
+        } else if (kind == "chat") {
+            var text = profileField(incoming, "text");
+            if (text.type == "string" && text.size > 0 && text.size <= 1000) {
+                var outgoing = stringifyJSON({kind: "chat", from: clientId, text: text});
+                for (var i = 0; i < maxParticipants; i = i + 1) {
+                    if (participantSessions[i] != null) {
+                        server.send(i, outgoing);
+                    }
+                }
+            }
+        }
+    }
+     gc();
+};
+
+server.onDisconnect = function (clientId) {
+    removePeer(clientId);
+    gc();
+};
+
+if (server.enableTLS(certificatePath, privateKeyPath) == -1) {
+    print("TLS setup failed; the video call server was not started.");
+} else {
+    print("Open " + baseUrl);
+    server.run();
+}
