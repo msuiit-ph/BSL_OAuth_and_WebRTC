@@ -1,0 +1,439 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Video call and chat</title>
+  <style>
+    :root { font-family: system-ui, sans-serif; color: #172033; background: #f2f5fa; }
+    body { max-width: 90rem; margin: auto; padding: 1.5rem; }
+    h1 { margin: 0 0 .4rem; }
+    h2 { font-size: 1.1rem; margin: 0; }
+    p { color: #526179; }
+    button, .button { padding: .7rem 1rem; border: 0; border-radius: .5rem; font: inherit; font-weight: 600; cursor: pointer; text-decoration: none; }
+    button:disabled { opacity: .5; cursor: default; }
+    .primary { color: white; background: #1d4ed8; }
+    .secondary { color: #172033; background: #dbe3ee; }
+    .controls, .header, .login-actions { display: flex; flex-wrap: wrap; align-items: center; gap: .75rem; }
+    .header { justify-content: space-between; }
+    .layout { display: grid; grid-template-columns: minmax(0, 3fr) minmax(15rem, 1fr); gap: 1rem; margin-top: 1rem; }
+    .videos { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 18rem), 1fr)); gap: 1rem; }
+    figure { margin: 0; background: #172033; border-radius: .75rem; overflow: hidden; }
+    video { display: block; width: 100%; aspect-ratio: 16 / 9; object-fit: cover; background: #111827; }
+    figcaption { color: white; padding: .7rem 1rem; }
+    .person { display: flex; align-items: center; gap: .6rem; }
+    .avatar { position: relative; width: 2rem; height: 2rem; border-radius: 50%; display: inline-grid; place-items: center; flex: none; background: #dbe3ee; color: #172033; font-weight: 700; overflow: hidden; }
+    .avatar img { position: absolute; width: 100%; height: 100%; object-fit: cover; }
+    .controls { margin-top: 1rem; }
+    .chat { background: white; border: 1px solid #dfe5ef; border-radius: .75rem; padding: 1rem; display: flex; flex-direction: column; min-height: 22rem; }
+    #chat-log { flex: 1; overflow-y: auto; max-height: 24rem; overflow-wrap: anywhere; }
+    .chat-entry { display: flex; align-items: flex-start; gap: .5rem; margin: .9rem 0; }
+    .chat-entry p { margin: .2rem 0 0; color: #172033; white-space: pre-wrap; }
+    #chat-form { display: flex; gap: .5rem; }
+    #chat-input { flex: 1; min-width: 0; padding: .7rem; border: 1px solid #b8c5d6; border-radius: .5rem; font: inherit; }
+    #error { color: #b42318; }
+    [hidden] { display: none !important; }
+    @media (max-width: 700px) { .layout { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <section id="login" hidden>
+    <h1>Video call and chat</h1>
+    <p>Sign in to join the group call.</p>
+    <div class="login-actions">
+      <a class="button primary" href="/login/google">Continue with Google</a>
+      <a class="button secondary" href="/login/github">Continue with GitHub</a>
+    </div>
+  </section>
+  <main id="app" hidden>
+    <div class="header">
+      <div><h1>Video call and chat</h1><p id="identity"></p></div>
+      <button id="logout" class="secondary" type="button">Log out</button>
+    </div>
+    <div class="layout">
+      <section aria-label="Video call">
+        <div class="videos" id="videos">
+          <figure><video id="local" autoplay muted playsinline></video><figcaption>You</figcaption></figure>
+        </div>
+        <div class="controls">
+          <button id="join" class="primary" type="button">Join call</button>
+          <button id="leave" class="secondary" type="button" disabled>Leave call</button>
+          <button id="video-toggle" class="secondary" type="button" aria-pressed="true">Camera on</button>
+          <button id="audio-toggle" class="secondary" type="button" aria-pressed="true">Microphone on</button>
+        </div>
+        <p id="status" role="status">Ready to join.</p>
+      </section>
+      <aside class="chat" aria-label="Chat">
+        <h2>Chat</h2>
+        <div id="chat-log" role="log" aria-live="polite"></div>
+        <form id="chat-form">
+          <input id="chat-input" aria-label="Message" maxlength="1000" placeholder="Write a message" disabled>
+          <button id="chat-send" class="primary" type="submit" disabled>Send</button>
+        </form>
+      </aside>
+    </div>
+  </main>
+  <p id="session-status" role="status">Checking your session...</p>
+  <p id="error" role="alert" hidden></p>
+  <script>
+    const login = document.getElementById("login");
+    const app = document.getElementById("app");
+    const sessionStatus = document.getElementById("session-status");
+    const errorBox = document.getElementById("error");
+    const join = document.getElementById("join");
+    const leave = document.getElementById("leave");
+    const status = document.getElementById("status");
+    const localVideo = document.getElementById("local");
+    const videos = document.getElementById("videos");
+    const videoToggle = document.getElementById("video-toggle");
+    const audioToggle = document.getElementById("audio-toggle");
+    const chatInput = document.getElementById("chat-input");
+    const chatSend = document.getElementById("chat-send");
+    const chatLog = document.getElementById("chat-log");
+    const enabled = { video: true, audio: true };
+    const iceServers = [{ urls: "stun:stun.l.google.com:19302" }];
+
+    let stream = null;
+    let socket = null;
+    const participants = new Map();
+    let selfId = null;
+    let selfUser = null;
+    let messages = Promise.resolve();
+    let generation = 0;
+    let chatReady = false;
+
+    function setStatus(message) { status.textContent = message; }
+    function showError(message) { errorBox.textContent = message; errorBox.hidden = false; }
+    function setChatReady(ready) {
+      chatReady = ready;
+      chatInput.disabled = !ready;
+      chatSend.disabled = !ready;
+    }
+    function avatar(user) {
+      const icon = document.createElement("span");
+      icon.className = "avatar";
+      icon.textContent = (user.name || "P").trim().charAt(0).toUpperCase() || "P";
+      try {
+        const url = new URL(user.picture);
+        const host = url.hostname.toLowerCase();
+        if (url.protocol === "https:" &&
+            (host === "avatars.githubusercontent.com" || host.endsWith(".googleusercontent.com"))) {
+          const image = document.createElement("img");
+          image.alt = "";
+          image.referrerPolicy = "no-referrer";
+          image.addEventListener("error", () => image.remove());
+          image.src = url.href;
+          icon.prepend(image);
+        }
+      } catch {
+        // A missing or invalid provider picture uses the initial instead.
+      }
+      return icon;
+    }
+    function addChat(user, text) {
+      const entry = document.createElement("div");
+      entry.className = "chat-entry";
+      const content = document.createElement("div");
+      const name = document.createElement("strong");
+      name.textContent = user.name;
+      const body = document.createElement("p");
+      body.textContent = text;
+      content.append(name, body);
+      entry.append(avatar(user), content);
+      chatLog.appendChild(entry);
+      chatLog.scrollTop = chatLog.scrollHeight;
+    }
+    function removeParticipant(id) {
+      const participant = participants.get(id);
+      if (!participant) return;
+      participants.delete(id);
+      const current = participant.peer;
+      participant.peer = null;
+      if (current) current.close();
+      participant.tile.remove();
+      setChatReady(participants.size > 0);
+      setStatus(participants.size ? `${participants.size} participant(s) in the call.` : "Waiting for participants...");
+    }
+    function addParticipant(id, user) {
+      if (participants.has(id)) return participants.get(id);
+      const tile = document.createElement("figure");
+      const video = document.createElement("video");
+      video.autoplay = true;
+      video.playsInline = true;
+      const caption = document.createElement("figcaption");
+      caption.className = "person";
+      const name = document.createElement("span");
+      name.textContent = user.name;
+      caption.append(avatar(user), name);
+      tile.append(video, caption);
+      videos.appendChild(tile);
+      const participant = { id, user, tile, video, peer: null, candidates: [] };
+      participants.set(id, participant);
+      setChatReady(true);
+      setStatus(`${participants.size} participant(s) in the call.`);
+      return participant;
+    }
+    function cleanup(message) {
+      generation++;
+      if (socket) {
+        socket.onclose = null;
+        socket.close();
+      }
+      socket = null;
+      for (const id of [...participants.keys()]) removeParticipant(id);
+      selfId = null;
+      selfUser = null;
+      if (stream) stream.getTracks().forEach(track => track.stop());
+      stream = null;
+      localVideo.srcObject = null;
+      join.disabled = false;
+      leave.disabled = true;
+      videoToggle.disabled = false;
+      audioToggle.disabled = false;
+      setChatReady(false);
+      setStatus(message);
+    }
+    function send(data) {
+      if (!socket || socket.readyState !== WebSocket.OPEN) throw new Error("Signaling disconnected");
+      socket.send(JSON.stringify(data));
+    }
+    function sendSignal(id, data) {
+      send({ kind: "signal", target: id, data });
+    }
+    function createPeer(participant, answering = false) {
+      const current = new RTCPeerConnection({ iceServers });
+      const incoming = new MediaStream();
+      participant.peer = current;
+      if (!answering) {
+        for (const kind of ["audio", "video"]) {
+          const track = stream.getTracks().find(item => item.kind === kind);
+          current.addTransceiver(track || kind, { direction: "sendrecv", streams: [stream] });
+        }
+      }
+      current.onicecandidate = event => {
+        if (participant.peer === current && event.candidate && socket && socket.readyState === WebSocket.OPEN) {
+          sendSignal(participant.id, { type: "candidate", candidate: event.candidate });
+        }
+      };
+      current.ontrack = event => {
+        if (participant.peer === current) {
+          incoming.addTrack(event.track);
+          participant.video.srcObject = incoming;
+        }
+      };
+      current.onconnectionstatechange = () => {
+        if (participant.peer !== current) return;
+        if (current.connectionState === "connected") setStatus(`${participants.size} participant(s) in the call.`);
+        if (current.connectionState === "failed") setStatus(`Connection to ${participant.user.name} failed. A TURN server may be required.`);
+        if (current.connectionState === "disconnected") setStatus("Connection interrupted.");
+      };
+      return current;
+    }
+    async function handleMessage(text, myGeneration) {
+      if (myGeneration !== generation) return;
+      const message = JSON.parse(text);
+      if (message.kind === "self") {
+        selfId = message.id;
+        selfUser = message.user;
+        setStatus("Waiting for participants...");
+        return;
+      }
+      if (message.kind === "left") {
+        removeParticipant(message.id);
+        return;
+      }
+      if (message.kind === "existing" || message.kind === "joined") {
+        const participant = addParticipant(message.id, message.user);
+        if (message.kind !== "existing") return;
+        const current = createPeer(participant);
+        const offer = await current.createOffer();
+        if (myGeneration !== generation || participant.peer !== current || !participants.has(message.id)) return;
+        await current.setLocalDescription(offer);
+        if (myGeneration === generation && participant.peer === current && participants.has(message.id)) {
+          sendSignal(message.id, { type: "offer", description: current.localDescription });
+        }
+        return;
+      }
+      if (message.kind === "chat") {
+        const user = message.from === selfId ? selfUser : participants.get(message.from)?.user;
+        if (user && typeof message.text === "string" && message.text.length <= 1000) addChat(user, message.text);
+        return;
+      }
+      if (message.kind !== "signal") return;
+      const participant = participants.get(message.from);
+      if (!participant || !message.data) return;
+      const data = message.data;
+      if (data.type === "offer") {
+        const current = createPeer(participant, true);
+        await current.setRemoteDescription(data.description);
+        if (myGeneration !== generation || participant.peer !== current || !participants.has(message.from)) return;
+        for (const transceiver of current.getTransceivers()) {
+          const kind = transceiver.receiver.track.kind;
+          transceiver.direction = "sendrecv";
+          transceiver.sender.setStreams(stream);
+          const track = stream.getTracks().find(item => item.kind === kind);
+          if (track) await transceiver.sender.replaceTrack(track);
+        }
+        for (const candidate of participant.candidates) await current.addIceCandidate(candidate);
+        participant.candidates = [];
+        const answer = await current.createAnswer();
+        await current.setLocalDescription(answer);
+        if (myGeneration === generation && participant.peer === current && participants.has(message.from)) {
+          sendSignal(message.from, { type: "answer", description: current.localDescription });
+        }
+      } else if (data.type === "answer" && participant.peer) {
+        const current = participant.peer;
+        await current.setRemoteDescription(data.description);
+        if (myGeneration !== generation || participant.peer !== current || !participants.has(message.from)) return;
+        for (const candidate of participant.candidates) await current.addIceCandidate(candidate);
+        participant.candidates = [];
+      } else if (data.type === "candidate") {
+        if (participant.peer && participant.peer.remoteDescription) await participant.peer.addIceCandidate(data.candidate);
+        else participant.candidates.push(data.candidate);
+      }
+    }
+    join.addEventListener("click", async () => {
+      join.disabled = true;
+      leave.disabled = false;
+      videoToggle.disabled = true;
+      audioToggle.disabled = true;
+      const myGeneration = ++generation;
+      setStatus("Preparing your call...");
+      try {
+        const acquired = enabled.video || enabled.audio
+          ? await navigator.mediaDevices.getUserMedia({ video: enabled.video, audio: enabled.audio })
+          : new MediaStream();
+        if (myGeneration !== generation) {
+          acquired.getTracks().forEach(track => track.stop());
+          return;
+        }
+        stream = acquired;
+        localVideo.srcObject = stream;
+        videoToggle.disabled = false;
+        audioToggle.disabled = false;
+        socket = new WebSocket(`${location.protocol === "https:" ? "wss:" : "ws:"}//${location.host}/signal`);
+        socket.onopen = () => setStatus("Connected to signaling server...");
+        socket.onmessage = event => {
+          messages = messages.then(() => handleMessage(event.data, myGeneration)).catch(error => {
+            console.error("WebRTC signaling error:", error);
+            if (myGeneration === generation) cleanup("Signaling failed. Please join again.");
+          });
+        };
+        socket.onerror = () => setStatus("Could not connect to the signaling server.");
+        socket.onclose = () => {
+          if (myGeneration === generation) cleanup("Signaling disconnected. The call may be full or your session may have expired.");
+        };
+      } catch (error) {
+        console.error("Could not start call:", error);
+        if (myGeneration === generation) cleanup("Could not access the selected devices or start signaling.");
+      }
+    });
+    async function toggleMedia(kind, button) {
+      const desired = !enabled[kind];
+      const myGeneration = generation;
+      let addedTrack = null;
+      button.disabled = true;
+      try {
+        if (stream) {
+          let track = stream.getTracks().find(item => item.kind === kind);
+          if (desired && !track) {
+            const acquired = await navigator.mediaDevices.getUserMedia({ [kind]: true });
+            if (myGeneration !== generation || !stream) {
+              acquired.getTracks().forEach(item => item.stop());
+              return;
+            }
+            track = acquired.getTracks()[0];
+            if (!track) throw new Error(`No ${kind} track was returned`);
+            stream.addTrack(track);
+            addedTrack = track;
+            for (const participant of participants.values()) {
+              if (!participant.peer) continue;
+              const transceiver = participant.peer.getTransceivers().find(item => item.receiver.track.kind === kind);
+              if (transceiver) await transceiver.sender.replaceTrack(track);
+            }
+            if (myGeneration !== generation) return;
+          }
+          if (track) track.enabled = desired;
+        }
+        enabled[kind] = desired;
+        button.setAttribute("aria-pressed", String(desired));
+        button.textContent = `${kind === "video" ? "Camera" : "Microphone"} ${desired ? "on" : "off"}`;
+      } catch (error) {
+        if (addedTrack) {
+          for (const participant of participants.values()) {
+            if (!participant.peer) continue;
+            const sender = participant.peer.getSenders().find(item => item.track === addedTrack);
+            if (sender) {
+              try { await sender.replaceTrack(null); }
+              catch (rollbackError) { console.error("Could not remove failed media track:", rollbackError); }
+            }
+          }
+          if (stream) stream.removeTrack(addedTrack);
+          addedTrack.stop();
+        }
+        console.error(`Could not change ${kind}:`, error);
+        setStatus(`Could not enable ${kind}. Check device permissions and try again.`);
+      } finally {
+        if (myGeneration === generation) button.disabled = false;
+      }
+    }
+    videoToggle.addEventListener("click", () => toggleMedia("video", videoToggle));
+    audioToggle.addEventListener("click", () => toggleMedia("audio", audioToggle));
+    leave.addEventListener("click", () => cleanup("You left the call."));
+    document.getElementById("chat-form").addEventListener("submit", event => {
+      event.preventDefault();
+      const text = chatInput.value.trim();
+      if (!text || !chatReady) return;
+      try {
+        if (new TextEncoder().encode(text).length > 1000) {
+          setStatus("Messages must be at most 1000 UTF-8 bytes.");
+          return;
+        }
+        send({ kind: "chat", text });
+        chatInput.value = "";
+      } catch (error) {
+        console.error("Could not send chat message:", error);
+        setStatus("Could not send message. Please rejoin the call.");
+      }
+    });
+    document.getElementById("logout").addEventListener("click", async () => {
+      try {
+        const response = await fetch("/logout", { method: "POST" });
+        if (!response.ok) throw new Error("Logout failed");
+        cleanup("You left the call.");
+        app.hidden = true;
+        login.hidden = false;
+        errorBox.hidden = true;
+        chatLog.replaceChildren();
+      } catch (error) {
+        console.error("Logout failed:", error);
+        showError("Could not log out. Please try again.");
+      }
+    });
+    async function checkSession() {
+      try {
+        const response = await fetch("/api/me", { cache: "no-store" });
+        sessionStatus.hidden = true;
+        if (response.status === 401) {
+          if (!app.hidden) cleanup("Session expired. Please sign in again.");
+          app.hidden = true;
+          login.hidden = false;
+          chatLog.replaceChildren();
+          return;
+        }
+        if (!response.ok) throw new Error("Session request failed");
+        const user = await response.json();
+        document.getElementById("identity").textContent = `Signed in as ${user.name || user.login || user.email || "user"}`;
+        login.hidden = true;
+        app.hidden = false;
+      } catch (error) {
+        console.error("Session check failed:", error);
+        showError("Could not check your session. Please refresh the page.");
+      }
+    }
+    checkSession();
+    setInterval(checkSession, 60000);
+    window.addEventListener("beforeunload", () => cleanup("Call ended."));
+  </script>
+</body>
+</html>
