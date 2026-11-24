@@ -78,7 +78,7 @@ function profileField(profile, key) {
 server.get = function (path, request) {
     server.addHeader("Cache-Control: no-store");
     if (path == "/") {
-        server.sendFile("videocall.html");
+        server.sendFile("public/index.html");
     } else if (path == "/login/google") {
         if (server.oauthStart("https://accounts.google.com/o/oauth2/v2/auth",
             googleClientId, googleRedirectUri, "openid email profile") != 1) {
